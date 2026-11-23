@@ -1,9 +1,10 @@
 use rand::Rng;
 use rdev::{ listen, Event, EventType, Key };
 use std::{
+    cell::Cell,
     collections::{ HashMap, HashSet },
     process::Command,
-    sync::{ atomic::{ AtomicBool, AtomicU64, Ordering }, Arc, Mutex },
+    sync::{ Arc, Mutex },
     thread,
     time::{ Duration, Instant },
 };
@@ -61,10 +62,16 @@ fn xdotool_key_name_from_rdev_key(key: Key) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerRequest {
+    Idle,
+    Run(u64),
+    Shutdown,
+}
+
 #[derive(Clone)]
 struct ControllerContext {
-    is_worker_running_flag: Arc<AtomicBool>,
-    active_worker_run_id: Arc<AtomicU64>,
+    worker_request: Arc<Mutex<WorkerRequest>>,
     this_worker_run_id: u64,
 
     system_pressed_keyboard_keys: Arc<Mutex<HashSet<String>>>,
@@ -75,14 +82,13 @@ struct ControllerContext {
 
     recent_injected_key_times: Arc<Mutex<HashMap<String, Instant>>>,
 
-    should_skip_next_passive_skill_once: Arc<AtomicBool>,
-    should_skip_rest_of_current_combo_once: Arc<AtomicBool>,
+    should_skip_next_passive_skill_once: Cell<bool>,
+    should_skip_rest_of_current_combo_once: Cell<bool>,
 }
 
 impl ControllerContext {
     fn is_stop_requested(&self) -> bool {
-        !self.is_worker_running_flag.load(Ordering::Relaxed) ||
-            self.active_worker_run_id.load(Ordering::Relaxed) != self.this_worker_run_id
+        *self.worker_request.lock().unwrap() != WorkerRequest::Run(self.this_worker_run_id)
     }
 
     fn is_user_currently_requesting_pause(&self) -> bool {
@@ -90,19 +96,19 @@ impl ControllerContext {
     }
 
     fn mark_should_skip_next_passive_skill_once(&self) {
-        self.should_skip_next_passive_skill_once.store(true, Ordering::Relaxed);
+        self.should_skip_next_passive_skill_once.set(true);
     }
 
     fn take_should_skip_next_passive_skill_once(&self) -> bool {
-        self.should_skip_next_passive_skill_once.swap(false, Ordering::Relaxed)
+        self.should_skip_next_passive_skill_once.replace(false)
     }
 
     fn mark_should_skip_rest_of_current_combo_once(&self) {
-        self.should_skip_rest_of_current_combo_once.store(true, Ordering::Relaxed);
+        self.should_skip_rest_of_current_combo_once.set(true);
     }
 
     fn take_should_skip_rest_of_current_combo_once(&self) -> bool {
-        self.should_skip_rest_of_current_combo_once.swap(false, Ordering::Relaxed)
+        self.should_skip_rest_of_current_combo_once.replace(false)
     }
 
     fn wait_until_user_is_idle_for_seconds(&self, required_idle_seconds: f64) -> bool {
@@ -937,6 +943,22 @@ fn run_skill_worker_loop(controller: ControllerContext) {
     log_with_elapsed_time(worker_log_start_time, "Stopped");
 }
 
+fn run_worker(controller: ControllerContext) {
+    loop {
+        let request = *controller.worker_request.lock().unwrap();
+        match request {
+            WorkerRequest::Idle => thread::park(),
+            WorkerRequest::Run(run_id) => {
+                run_skill_worker_loop(ControllerContext {
+                    this_worker_run_id: run_id,
+                    ..controller.clone()
+                });
+            }
+            WorkerRequest::Shutdown => return,
+        }
+    }
+}
+
 fn is_injected_pause_key_event(
     system_pressed_keyboard_keys: &Arc<Mutex<HashSet<String>>>,
     recent_injected_key_times: &Arc<Mutex<HashMap<String, Instant>>>,
@@ -966,129 +988,75 @@ fn is_injected_pause_key_event(
 }
 
 fn main() {
-    let is_worker_running_flag = Arc::new(AtomicBool::new(false));
-    let active_worker_run_id = Arc::new(AtomicU64::new(0));
+    let worker_request = Arc::new(Mutex::new(WorkerRequest::Idle));
+    let controller = ControllerContext {
+        worker_request: worker_request.clone(),
+        this_worker_run_id: 0,
+        system_pressed_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
+        system_pressed_mouse_buttons: Arc::new(Mutex::new(HashSet::new())),
+        user_pressed_pause_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
+        last_user_input_change_time: Arc::new(
+            Mutex::new(Instant::now() - Duration::from_secs(60))
+        ),
+        recent_injected_key_times: Arc::new(Mutex::new(HashMap::new())),
+        should_skip_next_passive_skill_once: Cell::new(false),
+        should_skip_rest_of_current_combo_once: Cell::new(false),
+    };
 
-    let system_pressed_keyboard_keys = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let system_pressed_mouse_buttons = Arc::new(Mutex::new(HashSet::<u8>::new()));
-
-    let user_pressed_pause_keyboard_keys = Arc::new(Mutex::new(HashSet::<Key>::new()));
-    let last_user_input_change_time = Arc::new(
-        Mutex::new(Instant::now() - Duration::from_secs(60))
-    );
-
-    let recent_injected_key_times = Arc::new(Mutex::new(HashMap::<String, Instant>::new()));
-
-    let should_skip_next_passive_skill_once = Arc::new(AtomicBool::new(false));
-    let should_skip_rest_of_current_combo_once = Arc::new(AtomicBool::new(false));
-
-    let is_worker_running_flag_for_listener = is_worker_running_flag.clone();
-    let active_worker_run_id_for_listener = active_worker_run_id.clone();
-
-    let system_pressed_keyboard_keys_for_listener = system_pressed_keyboard_keys.clone();
-    let system_pressed_mouse_buttons_for_listener = system_pressed_mouse_buttons.clone();
-
-    let user_pressed_pause_keyboard_keys_for_listener = user_pressed_pause_keyboard_keys.clone();
-    let last_user_input_change_time_for_listener = last_user_input_change_time.clone();
-
-    let recent_injected_key_times_for_listener = recent_injected_key_times.clone();
-
-    let should_skip_next_passive_skill_once_for_listener =
-        should_skip_next_passive_skill_once.clone();
-    let should_skip_rest_of_current_combo_once_for_listener =
-        should_skip_rest_of_current_combo_once.clone();
+    let listener_controller = controller.clone();
+    let worker = thread::spawn(move || run_worker(controller));
+    let worker_thread = worker.thread().clone();
+    let mut run_id = 0;
 
     println!("F9 = Start loop, F10 = Stop");
 
-    if
-        let Err(error) = listen(move |event: Event| {
-            match event.event_type {
-                EventType::KeyPress(key) => {
-                    if key == Key::F9 {
-                        let new_worker_run_id =
-                            active_worker_run_id_for_listener.fetch_add(1, Ordering::Relaxed) + 1;
-                        is_worker_running_flag_for_listener.store(true, Ordering::Relaxed);
-
-                        let controller = ControllerContext {
-                            is_worker_running_flag: is_worker_running_flag_for_listener.clone(),
-                            active_worker_run_id: active_worker_run_id_for_listener.clone(),
-                            this_worker_run_id: new_worker_run_id,
-
-                            system_pressed_keyboard_keys: system_pressed_keyboard_keys_for_listener.clone(),
-                            system_pressed_mouse_buttons: system_pressed_mouse_buttons_for_listener.clone(),
-
-                            user_pressed_pause_keyboard_keys: user_pressed_pause_keyboard_keys_for_listener.clone(),
-                            last_user_input_change_time: last_user_input_change_time_for_listener.clone(),
-
-                            recent_injected_key_times: recent_injected_key_times_for_listener.clone(),
-
-                            should_skip_next_passive_skill_once: should_skip_next_passive_skill_once_for_listener.clone(),
-                            should_skip_rest_of_current_combo_once: should_skip_rest_of_current_combo_once_for_listener.clone(),
-                        };
-
-                        controller.release_all_system_inputs();
-                        thread::spawn(move || run_skill_worker_loop(controller));
-                        return;
-                    }
-
-                    if key == Key::F10 {
-                        is_worker_running_flag_for_listener.store(false, Ordering::Relaxed);
-                        active_worker_run_id_for_listener.fetch_add(1, Ordering::Relaxed);
-
-                        let controller = ControllerContext {
-                            is_worker_running_flag: is_worker_running_flag_for_listener.clone(),
-                            active_worker_run_id: active_worker_run_id_for_listener.clone(),
-                            this_worker_run_id: active_worker_run_id_for_listener.load(
-                                Ordering::Relaxed
-                            ),
-
-                            system_pressed_keyboard_keys: system_pressed_keyboard_keys_for_listener.clone(),
-                            system_pressed_mouse_buttons: system_pressed_mouse_buttons_for_listener.clone(),
-
-                            user_pressed_pause_keyboard_keys: user_pressed_pause_keyboard_keys_for_listener.clone(),
-                            last_user_input_change_time: last_user_input_change_time_for_listener.clone(),
-
-                            recent_injected_key_times: recent_injected_key_times_for_listener.clone(),
-
-                            should_skip_next_passive_skill_once: should_skip_next_passive_skill_once_for_listener.clone(),
-                            should_skip_rest_of_current_combo_once: should_skip_rest_of_current_combo_once_for_listener.clone(),
-                        };
-
-                        controller.release_all_system_inputs();
-                        return;
-                    }
-
-                    if
-                        is_user_manual_pause_key(key) &&
-                        !is_injected_pause_key_event(
-                            &system_pressed_keyboard_keys_for_listener,
-                            &recent_injected_key_times_for_listener,
-                            key
-                        )
-                    {
-                        user_pressed_pause_keyboard_keys_for_listener.lock().unwrap().insert(key);
-                        *last_user_input_change_time_for_listener.lock().unwrap() = Instant::now();
-                    }
-                }
-
-                EventType::KeyRelease(key) => {
-                    if
-                        is_user_manual_pause_key(key) &&
-                        !is_injected_pause_key_event(
-                            &system_pressed_keyboard_keys_for_listener,
-                            &recent_injected_key_times_for_listener,
-                            key
-                        )
-                    {
-                        user_pressed_pause_keyboard_keys_for_listener.lock().unwrap().remove(&key);
-                        *last_user_input_change_time_for_listener.lock().unwrap() = Instant::now();
-                    }
-                }
-
-                _ => {}
+    let listen_result = listen(move |event: Event| {
+        match event.event_type {
+            EventType::KeyPress(Key::F9) => {
+                run_id += 1;
+                *listener_controller.worker_request.lock().unwrap() = WorkerRequest::Run(run_id);
+                worker_thread.unpark();
             }
-        })
-    {
+            EventType::KeyPress(Key::F10) => {
+                *listener_controller.worker_request.lock().unwrap() = WorkerRequest::Idle;
+            }
+            EventType::KeyPress(key) => {
+                if
+                    is_user_manual_pause_key(key) &&
+                    !is_injected_pause_key_event(
+                        &listener_controller.system_pressed_keyboard_keys,
+                        &listener_controller.recent_injected_key_times,
+                        key
+                    )
+                {
+                    listener_controller.user_pressed_pause_keyboard_keys.lock().unwrap().insert(key);
+                    *listener_controller.last_user_input_change_time.lock().unwrap() = Instant::now();
+                }
+            }
+            EventType::KeyRelease(key) => {
+                if
+                    is_user_manual_pause_key(key) &&
+                    !is_injected_pause_key_event(
+                        &listener_controller.system_pressed_keyboard_keys,
+                        &listener_controller.recent_injected_key_times,
+                        key
+                    )
+                {
+                    listener_controller.user_pressed_pause_keyboard_keys.lock().unwrap().remove(&key);
+                    *listener_controller.last_user_input_change_time.lock().unwrap() = Instant::now();
+                }
+            }
+            _ => {}
+        }
+    });
+
+    if let Err(error) = listen_result {
         eprintln!("Error: {:?}", error);
+    }
+
+    *worker_request.lock().unwrap() = WorkerRequest::Shutdown;
+    worker.thread().unpark();
+    if worker.join().is_err() {
+        eprintln!("Skill worker stopped unexpectedly");
     }
 }
