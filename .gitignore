@@ -1,5 +1,4 @@
 /target/
 **/*.rs.bk
 input-timing.log
-/input-timing.*.log
-/manual-input-timing.*.log
+logs
