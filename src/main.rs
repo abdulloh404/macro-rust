@@ -1,12 +1,15 @@
+//! ส่งคำสั่งกดคีย์บอร์ดและเมาส์ผ่าน `xdotool` เพื่อเล่นชุดสกิลตามลำดับ
+//! `rdev` รับ F9 เพื่อเริ่มชุดสกิลใหม่ รับ F10 เพื่อหยุด และติดตามปุ่มที่ผู้ใช้กดเองเพื่อพัก macro
+
 use rand::Rng;
-use rdev::{ listen, Event, EventType, Key };
+use rdev::{listen, Event, EventType, Key};
 use std::{
     cell::Cell,
-    collections::{ HashMap, HashSet },
+    collections::{HashMap, HashSet},
     process::Command,
-    sync::{ Arc, Mutex },
+    sync::{Arc, Mutex},
     thread,
-    time::{ Duration, Instant },
+    time::{Duration, Instant},
 };
 
 fn run_xdotool_command(arguments: &[&str]) {
@@ -21,25 +24,29 @@ fn format_elapsed_time_mm_ss(program_start_time: Instant) -> String {
 }
 
 fn log_with_elapsed_time(program_start_time: Instant, message: &str) {
-    println!("{} | {}", message, format_elapsed_time_mm_ss(program_start_time));
+    println!(
+        "{} | {}",
+        message,
+        format_elapsed_time_mm_ss(program_start_time)
+    );
 }
 
 fn is_user_manual_pause_key(key: Key) -> bool {
     matches!(
         key,
-        Key::KeyQ |
-            Key::KeyW |
-            Key::KeyE |
-            Key::KeyA |
-            Key::KeyS |
-            Key::KeyD |
-            Key::KeyF |
-            Key::KeyZ |
-            Key::KeyX |
-            Key::KeyC |
-            Key::Space |
-            Key::KeyV |
-            Key::ShiftLeft
+        Key::KeyQ
+            | Key::KeyW
+            | Key::KeyE
+            | Key::KeyA
+            | Key::KeyS
+            | Key::KeyD
+            | Key::KeyF
+            | Key::KeyZ
+            | Key::KeyX
+            | Key::KeyC
+            | Key::Space
+            | Key::KeyV
+            | Key::ShiftLeft
     )
 }
 
@@ -62,6 +69,7 @@ fn xdotool_key_name_from_rdev_key(key: Key) -> Option<&'static str> {
     }
 }
 
+/// คำสั่งล่าสุดที่ listener ส่งให้ worker
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkerRequest {
     Idle,
@@ -69,6 +77,8 @@ enum WorkerRequest {
     Shutdown,
 }
 
+/// แชร์สถานะ input กับ listener ผ่าน `Arc`
+/// ใช้ `Cell` ให้แต่ละรอบที่เริ่มด้วย F9 มี flag ข้ามสกิลของตัวเอง
 #[derive(Clone)]
 struct ControllerContext {
     worker_request: Arc<Mutex<WorkerRequest>>,
@@ -87,12 +97,17 @@ struct ControllerContext {
 }
 
 impl ControllerContext {
+    /// คืน `true` เมื่อ F10 สั่งหยุด เมื่อ listener สิ้นสุด หรือเมื่อ F9 ขอ run ID ใหม่
     fn is_stop_requested(&self) -> bool {
         *self.worker_request.lock().unwrap() != WorkerRequest::Run(self.this_worker_run_id)
     }
 
     fn is_user_currently_requesting_pause(&self) -> bool {
-        !self.user_pressed_pause_keyboard_keys.lock().unwrap().is_empty()
+        !self
+            .user_pressed_pause_keyboard_keys
+            .lock()
+            .unwrap()
+            .is_empty()
     }
 
     fn mark_should_skip_next_passive_skill_once(&self) {
@@ -111,6 +126,8 @@ impl ControllerContext {
         self.should_skip_rest_of_current_combo_once.replace(false)
     }
 
+    /// คืน `true` เมื่อผู้ใช้ปล่อยปุ่มพักทั้งหมดและผ่านช่วงเวลาที่กำหนดนับจาก event ล่าสุดของปุ่มพัก
+    /// หากพบการพักระหว่างรอ จะตั้ง flag ข้ามคอมโบส่วนที่เหลือและ passive skill ถัดไป
     fn wait_until_user_is_idle_for_seconds(&self, required_idle_seconds: f64) -> bool {
         let required_idle_duration = Duration::from_secs_f64(required_idle_seconds);
         let sleep_tick = Duration::from_millis(5);
@@ -144,9 +161,14 @@ impl ControllerContext {
     }
 
     fn mark_recent_injected_key_time(&self, key: &str) {
-        self.recent_injected_key_times.lock().unwrap().insert(key.to_string(), Instant::now());
+        self.recent_injected_key_times
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), Instant::now());
     }
 
+    /// แบ่งช่วงหน่วงเวลาเป็นช่วงสั้น ๆ เพื่อเช็กคำสั่งหยุดและการกดปุ่มพัก
+    /// คืน `false` เมื่อ worker ต้องหยุด หรือคืน `true` หลังหน่วงครบหรือผู้ใช้กลับสู่สถานะ idle
     fn sleep_seconds_interruptible(&self, seconds: f64) -> bool {
         if seconds <= 0.0 {
             return !self.is_stop_requested();
@@ -223,6 +245,7 @@ impl ControllerContext {
         run_xdotool_command(&["click", &button.to_string()]);
     }
 
+    /// กดปุ่มสั้น ๆ หลังผู้ใช้ idle โดยค่า `true` รวมกรณีที่ flag สั่งข้ามการกดครั้งนี้
     fn system_tap_key(&self, key: &str) -> bool {
         if self.is_stop_requested() {
             self.release_all_system_inputs();
@@ -252,7 +275,9 @@ impl ControllerContext {
         true
     }
 
+    /// ส่งคำสั่งปล่อยเฉพาะปุ่มคีย์บอร์ดและเมาส์ที่ worker บันทึกว่ากดค้างอยู่
     fn release_all_system_inputs(&self) {
+        // คืน lock ก่อนเรียก `xdotool` เพื่อให้ listener ตรวจสถานะปุ่มได้ระหว่างส่งคำสั่ง
         let pressed_keys_snapshot: Vec<String> = {
             let mut pressed = self.system_pressed_keyboard_keys.lock().unwrap();
             let snapshot = pressed.iter().cloned().collect::<Vec<_>>();
@@ -276,6 +301,7 @@ impl ControllerContext {
     }
 }
 
+/// อ่านแล้วล้าง flag ข้ามคอมโบ พร้อมปล่อยปุ่มที่ worker กดค้างเมื่อ flag ถูกตั้งไว้
 fn should_abort_remaining_actions_of_current_combo(controller: &ControllerContext) -> bool {
     if controller.take_should_skip_rest_of_current_combo_once() {
         controller.release_all_system_inputs();
@@ -284,6 +310,7 @@ fn should_abort_remaining_actions_of_current_combo(controller: &ControllerContex
     false
 }
 
+/// จดเวลาที่ประมวลผลการกด buff ล่าสุดเพื่อเช็ก cooldown ของแต่ละปุ่ม
 #[derive(Debug)]
 struct BuffCooldownTracker {
     last_pressed_q: Option<Instant>,
@@ -316,7 +343,7 @@ impl BuffCooldownTracker {
         key: &str,
         last_pressed: &mut Option<Instant>,
         cooldown: Duration,
-        after_sleep_seconds: f64
+        after_sleep_seconds: f64,
     ) -> bool {
         if controller.is_stop_requested() {
             controller.release_all_system_inputs();
@@ -355,51 +382,43 @@ impl BuffCooldownTracker {
     }
 
     fn apply_buffs_once(&mut self, controller: &ControllerContext) -> bool {
-        if
-            !Self::press_key_if_ready(
-                controller,
-                "q",
-                &mut self.last_pressed_q,
-                Duration::from_secs(120),
-                0.75
-            )
-        {
+        if !Self::press_key_if_ready(
+            controller,
+            "q",
+            &mut self.last_pressed_q,
+            Duration::from_secs(120),
+            0.75,
+        ) {
             return false;
         }
 
-        if
-            !Self::press_key_if_ready(
-                controller,
-                "1",
-                &mut self.last_pressed_1,
-                Duration::from_secs(600),
-                0.95
-            )
-        {
+        if !Self::press_key_if_ready(
+            controller,
+            "1",
+            &mut self.last_pressed_1,
+            Duration::from_secs(600),
+            0.95,
+        ) {
             return false;
         }
 
-        if
-            !Self::press_key_if_ready(
-                controller,
-                "2",
-                &mut self.last_pressed_2,
-                Duration::from_secs(50),
-                0.75
-            )
-        {
+        if !Self::press_key_if_ready(
+            controller,
+            "2",
+            &mut self.last_pressed_2,
+            Duration::from_secs(50),
+            0.75,
+        ) {
             return false;
         }
 
-        if
-            !Self::press_key_if_ready(
-                controller,
-                "3",
-                &mut self.last_pressed_3,
-                Duration::from_secs(180),
-                1.2
-            )
-        {
+        if !Self::press_key_if_ready(
+            controller,
+            "3",
+            &mut self.last_pressed_3,
+            Duration::from_secs(180),
+            1.2,
+        ) {
             return false;
         }
 
@@ -415,6 +434,7 @@ impl BuffCooldownTracker {
         //     return false;
         // }
 
+        // เมื่อมาถึงขั้นนี้ ให้ลองกด `z` ท้ายชุด buff โดยข้ามการตรวจ cooldown
         if !controller.system_tap_key("z") {
             return false;
         }
@@ -866,6 +886,8 @@ fn perform_strong_skill_2(controller: &ControllerContext) -> bool {
     true
 }
 
+/// ลง buff ตอนเริ่ม แล้ววนคอมโบ 1 → 2 → 3 สองชุด โดยสลับ strong skill ในคอมโบ 3
+/// เช็ก cooldown ของ buff อีกครั้งหลังจบทั้งสองชุด
 fn run_skill_worker_loop(controller: ControllerContext) {
     let worker_log_start_time = Instant::now();
     let mut completed_rounds: u64 = 0;
@@ -877,7 +899,10 @@ fn run_skill_worker_loop(controller: ControllerContext) {
     }
 
     completed_rounds += 1;
-    log_with_elapsed_time(worker_log_start_time, &format!("Round #{completed_rounds} (pre-buff)"));
+    log_with_elapsed_time(
+        worker_log_start_time,
+        &format!("Round #{completed_rounds} (pre-buff)"),
+    );
 
     while !controller.is_stop_requested() {
         if !controller.sleep_random_range_seconds_interruptible(0.1, 0.15) {
@@ -936,13 +961,17 @@ fn run_skill_worker_loop(controller: ControllerContext) {
         }
 
         completed_rounds += 1;
-        log_with_elapsed_time(worker_log_start_time, &format!("Round #{completed_rounds} done"));
+        log_with_elapsed_time(
+            worker_log_start_time,
+            &format!("Round #{completed_rounds} done"),
+        );
     }
 
     controller.release_all_system_inputs();
     log_with_elapsed_time(worker_log_start_time, "Stopped");
 }
 
+/// ประมวลผลคำสั่งบน thread เดียวให้รอบเก่าปล่อย input เสร็จก่อนเริ่มรอบใหม่
 fn run_worker(controller: ControllerContext) {
     loop {
         let request = *controller.worker_request.lock().unwrap();
@@ -959,25 +988,30 @@ fn run_worker(controller: ControllerContext) {
     }
 }
 
+/// ประเมินว่า event ของปุ่มพักมาจาก input ที่ macro ส่งเองหรือไม่
 fn is_injected_pause_key_event(
     system_pressed_keyboard_keys: &Arc<Mutex<HashSet<String>>>,
     recent_injected_key_times: &Arc<Mutex<HashMap<String, Instant>>>,
-    key: Key
+    key: Key,
 ) -> bool {
     let Some(key_name) = xdotool_key_name_from_rdev_key(key) else {
         return false;
     };
 
-    if system_pressed_keyboard_keys.lock().unwrap().contains(key_name) {
+    if system_pressed_keyboard_keys
+        .lock()
+        .unwrap()
+        .contains(key_name)
+    {
         return true;
     }
 
-    if
-        let Some(last_injected_time) = recent_injected_key_times
-            .lock()
-            .unwrap()
-            .get(key_name)
-            .cloned()
+    // เผื่อเวลาที่ event จาก `xdotool` อาจมาถึงหลังปุ่มถูกนำออกจากชุดปุ่มที่กดค้าง
+    if let Some(last_injected_time) = recent_injected_key_times
+        .lock()
+        .unwrap()
+        .get(key_name)
+        .cloned()
     {
         if last_injected_time.elapsed() < Duration::from_millis(120) {
             return true;
@@ -995,9 +1029,7 @@ fn main() {
         system_pressed_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
         system_pressed_mouse_buttons: Arc::new(Mutex::new(HashSet::new())),
         user_pressed_pause_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
-        last_user_input_change_time: Arc::new(
-            Mutex::new(Instant::now() - Duration::from_secs(60))
-        ),
+        last_user_input_change_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
         recent_injected_key_times: Arc::new(Mutex::new(HashMap::new())),
         should_skip_next_passive_skill_once: Cell::new(false),
         should_skip_rest_of_current_combo_once: Cell::new(false),
@@ -1010,50 +1042,61 @@ fn main() {
 
     println!("F9 = Start loop, F10 = Stop");
 
-    let listen_result = listen(move |event: Event| {
-        match event.event_type {
-            EventType::KeyPress(Key::F9) => {
-                run_id += 1;
-                *listener_controller.worker_request.lock().unwrap() = WorkerRequest::Run(run_id);
-                worker_thread.unpark();
-            }
-            EventType::KeyPress(Key::F10) => {
-                *listener_controller.worker_request.lock().unwrap() = WorkerRequest::Idle;
-            }
-            EventType::KeyPress(key) => {
-                if
-                    is_user_manual_pause_key(key) &&
-                    !is_injected_pause_key_event(
-                        &listener_controller.system_pressed_keyboard_keys,
-                        &listener_controller.recent_injected_key_times,
-                        key
-                    )
-                {
-                    listener_controller.user_pressed_pause_keyboard_keys.lock().unwrap().insert(key);
-                    *listener_controller.last_user_input_change_time.lock().unwrap() = Instant::now();
-                }
-            }
-            EventType::KeyRelease(key) => {
-                if
-                    is_user_manual_pause_key(key) &&
-                    !is_injected_pause_key_event(
-                        &listener_controller.system_pressed_keyboard_keys,
-                        &listener_controller.recent_injected_key_times,
-                        key
-                    )
-                {
-                    listener_controller.user_pressed_pause_keyboard_keys.lock().unwrap().remove(&key);
-                    *listener_controller.last_user_input_change_time.lock().unwrap() = Instant::now();
-                }
-            }
-            _ => {}
+    let listen_result = listen(move |event: Event| match event.event_type {
+        EventType::KeyPress(Key::F9) => {
+            run_id += 1;
+            *listener_controller.worker_request.lock().unwrap() = WorkerRequest::Run(run_id);
+            worker_thread.unpark();
         }
+        EventType::KeyPress(Key::F10) => {
+            *listener_controller.worker_request.lock().unwrap() = WorkerRequest::Idle;
+        }
+        EventType::KeyPress(key) => {
+            if is_user_manual_pause_key(key)
+                && !is_injected_pause_key_event(
+                    &listener_controller.system_pressed_keyboard_keys,
+                    &listener_controller.recent_injected_key_times,
+                    key,
+                )
+            {
+                listener_controller
+                    .user_pressed_pause_keyboard_keys
+                    .lock()
+                    .unwrap()
+                    .insert(key);
+                *listener_controller
+                    .last_user_input_change_time
+                    .lock()
+                    .unwrap() = Instant::now();
+            }
+        }
+        EventType::KeyRelease(key) => {
+            if is_user_manual_pause_key(key)
+                && !is_injected_pause_key_event(
+                    &listener_controller.system_pressed_keyboard_keys,
+                    &listener_controller.recent_injected_key_times,
+                    key,
+                )
+            {
+                listener_controller
+                    .user_pressed_pause_keyboard_keys
+                    .lock()
+                    .unwrap()
+                    .remove(&key);
+                *listener_controller
+                    .last_user_input_change_time
+                    .lock()
+                    .unwrap() = Instant::now();
+            }
+        }
+        _ => {}
     });
 
     if let Err(error) = listen_result {
         eprintln!("Error: {:?}", error);
     }
 
+    // ปลุก worker ที่อาจกำลังพัก แล้วรอให้จบรอบและปล่อย input ก่อนออกจากโปรแกรม
     *worker_request.lock().unwrap() = WorkerRequest::Shutdown;
     worker.thread().unpark();
     if worker.join().is_err() {
