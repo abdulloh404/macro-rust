@@ -29,3 +29,6 @@ jobs:
 
       - name: Check compilation
         run: cargo +stable check --locked
+
+      - name: Run tests
+        run: cargo +stable test --locked

@@ -1,20 +1,25 @@
 //! ส่งคำสั่งกดคีย์บอร์ดและเมาส์ผ่าน `xdotool` เพื่อเล่นชุดสกิลตามลำดับ
 //! `rdev` รับ F9 เพื่อเริ่มชุดสกิลใหม่ รับ F10 เพื่อหยุด และติดตามปุ่มที่ผู้ใช้กดเองเพื่อพัก macro
 
+mod input;
+mod manual_trace;
+
+#[cfg(test)]
+mod tests;
+
+use input::run_xdotool_command;
 use rand::Rng;
 use rdev::{listen, Event, EventType, Key};
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
-    process::Command,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-fn run_xdotool_command(arguments: &[&str]) {
-    let _ = Command::new("xdotool").args(arguments).status();
-}
+/// รับชื่อคำสั่งและปุ่มเป้าหมายเพื่อให้ test ใช้ตัวส่งจำลองกับ worker เดียวกันได้
+type SendInput = dyn Fn(&str, &str) + Send + Sync;
 
 fn format_elapsed_time_mm_ss(program_start_time: Instant) -> String {
     let elapsed_seconds = program_start_time.elapsed().as_secs();
@@ -83,6 +88,7 @@ enum WorkerRequest {
 struct ControllerContext {
     worker_request: Arc<Mutex<WorkerRequest>>,
     this_worker_run_id: u64,
+    send_input: Arc<SendInput>,
 
     system_pressed_keyboard_keys: Arc<Mutex<HashSet<String>>>,
     system_pressed_mouse_buttons: Arc<Mutex<HashSet<u8>>>,
@@ -97,6 +103,23 @@ struct ControllerContext {
 }
 
 impl ControllerContext {
+    fn new(send_input: Arc<SendInput>) -> Self {
+        Self {
+            worker_request: Arc::new(Mutex::new(WorkerRequest::Idle)),
+            this_worker_run_id: 0,
+            send_input,
+            system_pressed_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
+            system_pressed_mouse_buttons: Arc::new(Mutex::new(HashSet::new())),
+            user_pressed_pause_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
+            last_user_input_change_time: Arc::new(Mutex::new(
+                Instant::now() - Duration::from_secs(60),
+            )),
+            recent_injected_key_times: Arc::new(Mutex::new(HashMap::new())),
+            should_skip_next_passive_skill_once: Cell::new(false),
+            should_skip_rest_of_current_combo_once: Cell::new(false),
+        }
+    }
+
     /// คืน `true` เมื่อ F10 สั่งหยุด เมื่อ listener สิ้นสุด หรือเมื่อ F9 ขอ run ID ใหม่
     fn is_stop_requested(&self) -> bool {
         *self.worker_request.lock().unwrap() != WorkerRequest::Run(self.this_worker_run_id)
@@ -213,7 +236,7 @@ impl ControllerContext {
             let mut pressed = self.system_pressed_keyboard_keys.lock().unwrap();
             pressed.insert(key.to_string());
         }
-        run_xdotool_command(&["keydown", key]);
+        (self.send_input)("keydown", key);
     }
 
     fn system_key_up(&self, key: &str) {
@@ -222,7 +245,7 @@ impl ControllerContext {
             let mut pressed = self.system_pressed_keyboard_keys.lock().unwrap();
             pressed.remove(key);
         }
-        run_xdotool_command(&["keyup", key]);
+        (self.send_input)("keyup", key);
     }
 
     fn system_mouse_button_down(&self, button: u8) {
@@ -230,7 +253,7 @@ impl ControllerContext {
             let mut pressed = self.system_pressed_mouse_buttons.lock().unwrap();
             pressed.insert(button);
         }
-        run_xdotool_command(&["mousedown", &button.to_string()]);
+        (self.send_input)("mousedown", &button.to_string());
     }
 
     fn system_mouse_button_up(&self, button: u8) {
@@ -238,11 +261,11 @@ impl ControllerContext {
             let mut pressed = self.system_pressed_mouse_buttons.lock().unwrap();
             pressed.remove(&button);
         }
-        run_xdotool_command(&["mouseup", &button.to_string()]);
+        (self.send_input)("mouseup", &button.to_string());
     }
 
     fn system_click_mouse_button(&self, button: u8) {
-        run_xdotool_command(&["click", &button.to_string()]);
+        (self.send_input)("click", &button.to_string());
     }
 
     /// กดปุ่มสั้น ๆ หลังผู้ใช้ idle โดยค่า `true` รวมกรณีที่ flag สั่งข้ามการกดครั้งนี้
@@ -286,7 +309,7 @@ impl ControllerContext {
         };
         for key in pressed_keys_snapshot {
             self.mark_recent_injected_key_time(&key);
-            run_xdotool_command(&["keyup", &key]);
+            (self.send_input)("keyup", &key);
         }
 
         let pressed_mouse_snapshot: Vec<u8> = {
@@ -296,7 +319,7 @@ impl ControllerContext {
             snapshot
         };
         for button in pressed_mouse_snapshot {
-            run_xdotool_command(&["mouseup", &button.to_string()]);
+            (self.send_input)("mouseup", &button.to_string());
         }
     }
 }
@@ -1022,19 +1045,19 @@ fn is_injected_pause_key_event(
 }
 
 fn main() {
-    let worker_request = Arc::new(Mutex::new(WorkerRequest::Idle));
-    let controller = ControllerContext {
-        worker_request: worker_request.clone(),
-        this_worker_run_id: 0,
-        system_pressed_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
-        system_pressed_mouse_buttons: Arc::new(Mutex::new(HashSet::new())),
-        user_pressed_pause_keyboard_keys: Arc::new(Mutex::new(HashSet::new())),
-        last_user_input_change_time: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
-        recent_injected_key_times: Arc::new(Mutex::new(HashMap::new())),
-        should_skip_next_passive_skill_once: Cell::new(false),
-        should_skip_rest_of_current_combo_once: Cell::new(false),
-    };
+    // ให้โหมดบันทึก input ของผู้ใช้ทำงานก่อนสร้าง macro worker
+    if matches!(std::env::var("SKILLBOT_TRACE_MANUAL").as_deref(), Ok("1")) {
+        manual_trace::run();
+        return;
+    }
 
+    let trace_started_at =
+        matches!(std::env::var("SKILLBOT_TRACE_INPUT").as_deref(), Ok("1")).then(Instant::now);
+    let controller = ControllerContext::new(Arc::new(move |action, target| {
+        run_xdotool_command(action, target, trace_started_at);
+    }));
+
+    let worker_request = controller.worker_request.clone();
     let listener_controller = controller.clone();
     let worker = thread::spawn(move || run_worker(controller));
     let worker_thread = worker.thread().clone();
